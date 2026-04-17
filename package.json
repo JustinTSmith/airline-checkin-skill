@@ -1,0 +1,27 @@
+{
+  "name": "airline-checkin-skill",
+  "version": "1.0.0",
+  "description": "Automatic airline check-in for OpenClaw using Playwright",
+  "main": "checkin.js",
+  "scripts": {
+    "install-browser": "npx playwright install chromium",
+    "test": "node checkin.js --list",
+    "watch-gmail": "node gmail-watcher.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  },
+  "keywords": [
+    "airline",
+    "check-in",
+    "automation",
+    "openclaw",
+    "playwright",
+    "air-canada",
+    "united",
+    "delta",
+    "southwest"
+  ],
+  "author": "OpenClaw Community",
+  "license": "MIT"
+}
