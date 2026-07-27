@@ -1,252 +1,114 @@
-# Airline Auto Check-in Skill for OpenClaw
+# Airline Auto Check-in Skill
 
-Automatically check in to flights 24 hours before departure using Claude in Chrome browser automation.
+Schedules and executes flight check-in exactly 24 hours before departure using macOS launchd for timing and Playwright for the browser work, with pre-configured support for 8 airlines.
 
-## Installation
+## What it does
 
-1. **Copy skill to OpenClaw skills directory:**
+- Stores flight details (airline, booking reference, last name, departure time) in `~/.openclaw/flights/scheduled.json` and creates one macOS LaunchAgent per flight, timed to fire 24 hours before departure
+- At trigger time, launches Chromium via Playwright, navigates to the airline's check-in page, and fills the confirmation code and last name using 8 confirmation-field selectors and 7 name-field selectors to survive markup differences between airlines
+- Detects CAPTCHA pages and aborts with a notification instead of attempting to bypass them
+- Attempts to download the boarding pass PDF to `~/Downloads/boarding-passes/` and captures before-submit and completion screenshots for every run
+- Sends a Telegram notification on start, success, and failure, falling back to a native macOS notification when Telegram credentials are not set
+- Includes a Gmail watcher module that extracts airline, booking reference, last name, and departure time from confirmation emails with regex patterns and schedules check-ins automatically, deduplicating by message ID
+
+## Why it exists
+
+Check-in windows open 24 hours before departure, which is usually an inconvenient time, and on airlines with open seating the first minutes matter. Doing this manually means setting an alarm and racing through a form. This tool moves the race to a scheduled job on your own machine: you register the flight once (or let the Gmail watcher find it), and the boarding pass shows up in your downloads folder.
+
+## Architecture
+
+Trigger-to-boarding-pass flow as implemented in `checkin.js` and `gmail-watcher.js`:
+
+```mermaid
+flowchart TD
+    A[User schedules flight] --> C[scheduleFlight]
+    B[Gmail watcher<br>regex-extracts flight from email] --> C
+    C --> D[Write scheduled.json]
+    C --> E[Write LaunchAgent plist<br>StartCalendarInterval = T-24h]
+    E --> F[launchctl load]
+    F -->|24h before departure| G[checkin.js --execute flight-id]
+    G --> H[Notify: check-in started]
+    H --> I[Playwright launches Chromium]
+    I --> J[Navigate to airline check-in URL]
+    J --> K[Fill PNR<br>8 candidate selectors]
+    K --> L[Fill last name<br>7 candidate selectors]
+    L --> M[Screenshot, then click submit]
+    M --> N{CAPTCHA in page?}
+    N -->|Yes| O[Abort, log failure,<br>notify for manual check-in]
+    N -->|No| P[Optional: screenshot seat map]
+    P --> Q[Try boarding pass download<br>save PDF to ~/Downloads/boarding-passes/]
+    Q --> R[Final screenshot, mark completed,<br>append to history.json]
+    R --> S[Notify success via Telegram<br>or macOS notification]
+    O --> T[Unload and delete LaunchAgent]
+    S --> T
+```
+
+## Quick start
 
 ```bash
+# 1. Copy the skill into place
 cp -r airline-checkin-skill ~/.openclaw/skills/user/airline-checkin/
-```
 
-2. **Make the script executable:**
-
-```bash
+# 2. Make the script executable (the LaunchAgent invokes it directly)
 chmod +x ~/.openclaw/skills/user/airline-checkin/checkin.js
-```
 
-3. **Ensure Claude in Chrome is connected to OpenClaw**
+# 3. Install the one dependency and the Chromium build
+cd ~/.openclaw/skills/user/airline-checkin
+npm install
+npx playwright install chromium
 
-4. **Verify installation:**
-
-```bash
+# 4. Verify
 node ~/.openclaw/skills/user/airline-checkin/checkin.js --list
 ```
 
-## Quick Start
+Or run `./install.sh`, which performs the same steps.
 
-### Schedule a check-in via OpenClaw
+Optional Telegram notifications (otherwise macOS notifications are used):
 
-Talk to Claude in OpenClaw:
+```bash
+export TELEGRAM_BOT_TOKEN="your-bot-token"
+export TELEGRAM_CHAT_ID="your-chat-id"
+```
 
-> "Schedule check-in for my Air Canada flight AC789, confirmation DEF456, last name Wilson, departing March 25 at 10:45 AM EST"
-
-Claude will:
-1. Parse your flight details
-2. Calculate the 24-hour check-in time
-3. Schedule a launchd job
-4. Confirm the scheduling
-
-### Check your scheduled flights
-
-> "Show my upcoming flight check-ins"
-
-### Cancel a check-in
-
-> "Cancel the check-in for flight DEF456"
-
-## Manual Usage (via CLI)
-
-### Schedule a flight manually
+Schedule a flight from Node (synthetic example):
 
 ```javascript
 const { scheduleFlight } = require('~/.openclaw/skills/user/airline-checkin/checkin.js');
 
 scheduleFlight({
   airline: 'Air Canada',
-  pnr: 'ABC123',
-  lastName: 'Smith',
-  departureTime: '2026-03-25T10:45:00-05:00', // ISO 8601 format with timezone
-  timezone: 'EST',
-  seatPreference: 'window', // optional
-  email: 'you@example.com' // optional
+  pnr: 'ZZTEST',
+  lastName: 'Example',
+  departureTime: '2026-09-25T10:45:00-04:00',
+  timezone: 'EDT'
 });
 ```
 
-### List scheduled check-ins
+CLI commands:
 
 ```bash
-node ~/.openclaw/skills/user/airline-checkin/checkin.js --list
+node checkin.js --list              # show scheduled check-ins
+node checkin.js --cancel ZZTEST     # cancel by PNR or flight id
+node checkin.js --execute <id>      # run a check-in now
 ```
 
-### Cancel a check-in
+Pre-configured check-in URLs: Air Canada, United, Delta, Southwest, American, WestJet, Alaska, JetBlue. Any other airline works by passing `checkinUrl` when scheduling.
 
-```bash
-node ~/.openclaw/skills/user/airline-checkin/checkin.js --cancel ABC123
-```
+## Design decisions
 
-## How It Works
-
-### Scheduling
-1. Flight details are stored in `~/.openclaw/flights/scheduled.json`
-2. A macOS LaunchAgent is created at `~/Library/LaunchAgents/ai.openclaw.checkin.<flight-id>.plist`
-3. The job triggers at exactly 24 hours before departure
-
-### Execution
-1. LaunchAgent triggers the check-in script
-2. Script sends a prompt to Claude in Chrome via OpenClaw
-3. Claude navigates to airline's check-in page
-4. Fills in PNR and last name
-5. Completes check-in flow
-6. Downloads boarding pass to `~/Downloads/boarding-passes/`
-7. Sends macOS notification with result
-
-### Data Storage
-
-```
-~/.openclaw/flights/
-├── scheduled.json       # Upcoming check-ins
-├── history.json         # Completed check-ins
-├── checkin-*.log       # Execution logs
-└── checkin-*.error.log # Error logs
-```
-
-## Supported Airlines
-
-Works with any airline offering online check-in. Pre-configured URLs for:
-
-- Air Canada
-- United Airlines
-- Delta Air Lines
-- Southwest Airlines
-- American Airlines
-- WestJet
-- Alaska Airlines
-- JetBlue
-
-For other airlines, provide the check-in URL when scheduling.
-
-## Examples
-
-### Air Canada
-
-```
-"Schedule my Air Canada flight:
-- PNR: XYZ789
-- Last name: Thompson
-- Departing: March 28, 2026 at 6:30 AM EST
-- Preference: aisle seat"
-```
-
-### Southwest (custom URL)
-
-```javascript
-scheduleFlight({
-  airline: 'Southwest',
-  pnr: 'AB12CD',
-  lastName: 'Martinez',
-  departureTime: '2026-04-01T14:15:00-07:00',
-  timezone: 'PST',
-  checkinUrl: 'https://www.southwest.com/air/check-in/'
-});
-```
-
-### International flight
-
-```
-"Check in for my United flight to London:
-- Confirmation: UNT456
-- Name: Chen
-- Leaves April 5th at 8:00 PM EDT
-- Window seat please"
-```
-
-## Troubleshooting
-
-### Check-in didn't run
-
-**Verify the LaunchAgent is loaded:**
-```bash
-launchctl list | grep openclaw.checkin
-```
-
-**Check logs:**
-```bash
-cat ~/.openclaw/flights/checkin-<flight-id>.log
-```
-
-**Ensure your Mac is awake:**
-LaunchAgents require the Mac to be powered on. For overnight flights, keep your Mac awake or use a power schedule.
-
-### Check-in failed
-
-Common reasons:
-- PNR or last name incorrect
-- Check-in window not yet open (some airlines open slightly after 24hr mark)
-- Airline requires passport info
-- Special assistance needed
-- Route requires airport check-in
-
-Check `~/.openclaw/flights/history.json` for the error message.
-
-### Time zone issues
-
-Always provide departure time in **local airport time** with the correct timezone abbreviation (EST, PST, CST, MST, etc.).
-
-**Example:**
-- Flight departs Toronto at 10:45 AM local → use `EST` or `EDT` depending on season
-- Flight departs Vancouver at 6:30 PM local → use `PST` or `PDT`
-
-### Boarding pass not downloaded
-
-Some airlines:
-- Email boarding passes instead of downloading
-- Require you to print at airport
-- Use mobile-only boarding passes
-
-Check your email and the airline's app.
+- **launchd over a daemon.** Each flight gets its own LaunchAgent plist with a `StartCalendarInterval`, so nothing runs between flights and a crash cannot take out other scheduled check-ins. The plist is unloaded and deleted after execution, success or failure.
+- **Selector lists over per-airline scrapers.** Form fields are located by trying ordered lists of generic selectors (name, id, and placeholder patterns) rather than maintaining a scraper per airline. This trades reliability on unusual markup for zero per-airline maintenance. Seat selection is not implemented; if a seat map is detected, the script only screenshots it.
+- **Fail loudly, never bypass.** CAPTCHA detection aborts the run and notifies the user. Every run leaves screenshots and an entry in `history.json`, so a 6 a.m. failure is diagnosable after the fact.
+- **All state is local plain-text JSON.** Confirmation codes are not encrypted at rest, and completed flights are marked `completed` in `scheduled.json` rather than deleted. Treat the state directory as sensitive.
 
 ## Limitations
 
-- **macOS only** (uses LaunchAgents for scheduling)
-- **Requires Mac to be awake** at check-in time
-- **Cannot bypass CAPTCHA** (will notify you to complete manually)
-- **Some airlines block automation** (will notify you)
-- **Special requests require airport check-in** (wheelchair, unaccompanied minor, pet, etc.)
+- macOS only (LaunchAgents for scheduling, `osascript` for fallback notifications)
+- The Mac must be awake at check-in time
+- Cannot bypass CAPTCHA or bot detection; it notifies you to finish manually
+- Airlines that require passport data, special assistance, or airport check-in will fail with a logged error
+- The Gmail watcher is a library module: it requires the host agent to supply Gmail search and read functions and exits if run directly
 
-## Privacy & Security
+## Status
 
-- All data stored locally on your Mac
-- No cloud sync or third-party transmission
-- LaunchAgents run under your user account
-- Flight data deleted from `scheduled.json` after check-in completes
-- History retained in `history.json` (can be cleared manually)
-
-## Uninstallation
-
-### Remove all scheduled check-ins
-
-```bash
-# Cancel all flights
-node ~/.openclaw/skills/user/airline-checkin/checkin.js --list
-# Note each PNR, then cancel:
-node ~/.openclaw/skills/user/airline-checkin/checkin.js --cancel <PNR>
-
-# Or manually remove LaunchAgents:
-rm ~/Library/LaunchAgents/ai.openclaw.checkin.*.plist
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.checkin.*.plist
-```
-
-### Remove data
-
-```bash
-rm -rf ~/.openclaw/flights/
-```
-
-### Remove skill
-
-```bash
-rm -rf ~/.openclaw/skills/user/airline-checkin/
-```
-
-## Support
-
-For issues or feature requests, check:
-- `~/.openclaw/flights/checkin-*.log` for execution logs
-- `~/.openclaw/flights/history.json` for past results
-- OpenClaw documentation for Claude in Chrome setup
-
-## License
-
-MIT - use at your own risk. Always verify check-in was successful before heading to the airport.
+Experimental. The scheduling, execution, notification, and history paths are implemented end to end, but the browser flow relies on heuristic selectors, runs headed by default (`headless: false` with a note to flip it for production), and has no automated tests. Verify check-in succeeded before heading to the airport.
